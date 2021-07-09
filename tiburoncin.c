@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200112L
+
 #include <sys/select.h>
 
 #include <sys/time.h>
@@ -17,9 +19,11 @@
 #include "cmdline.h"
 #include "circular_buffer.h"
 
+#include "signal.h"
+
 #define MAX(a, b) (((a) > (b)) ? (a) : (b))
 
-int passthrough(struct endpoint *ep_producer, struct endpoint *ep_consumer, 
+int passthrough(struct endpoint *ep_producer, struct endpoint *ep_consumer,
 		fd_set *rfds, fd_set *wfds,
 		struct circular_buffer_t *b,
 		struct hexdump *hd) {
@@ -28,42 +32,75 @@ int passthrough(struct endpoint *ep_producer, struct endpoint *ep_consumer,
 	int s;
 
 	if (FD_ISSET(producer, rfds)) {	 // ready to produce
-		s = read(producer, &b->buf[b->head], circular_buffer_get_free(b));
-		if (s < 0) 
+		EINTR_RETRY(read(producer, &b->buf[b->head], circular_buffer_get_free(b)));
+
+		if (s < 0) {
+			/*
+			 * Despite that we use some sort of select/poll multiplexer
+			 * the read/write it could block.
+			 *
+			 * For example, if the fd is a socket and it receives data,
+			 * that would mark it "ready for reading" but if the packet
+			 * received is corrupted, it will be discarded and the read call will
+			 * block because there is not more data.
+			 *
+			 * To workaround this, the fd must have the O_NONBLOCK flag.
+			 * See select(2).
+			 * */
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
+				FD_CLR(producer, rfds);
+				goto read_would_block;
+			}
+
 			return -1;
-
-		/* ack to the other end that we received the shutdown */
-		if (s == 0) 
+		}
+		else if (s == 0) {
+			/* ack to the other end that we received the shutdown */
 			partial_shutdown(ep_producer, SHUT_RD);
-
-		/* print what we got */
-		hexdump_sent_print(hd, &b->buf[b->head], s);
+			hexdump_shutdown_print(hd);
+		}
+		else {
+			/* print what we got */
+			hexdump_sent_print(hd, &b->buf[b->head], s);
+		}
 
 		/* update our head pointer */
 		circular_buffer_advance_head(b, s);
 	}
 
+read_would_block:
+
 	if (FD_ISSET(consumer, wfds)) {	 // ready to consume
-		s = write(consumer, &b->buf[b->tail], circular_buffer_get_ready(b));
-		if (s < 0) 
+		EINTR_RETRY(write(consumer, &b->buf[b->tail], circular_buffer_get_ready(b)));
+
+		if (s < 0) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
+				FD_CLR(consumer, wfds);
+				goto write_would_block;
+			}
+
 			return -1;
-
-		/* ack to the other end that we received the shutdown */
-		if (s == 0)
+		}
+		else if (s == 0) {
+			/* ack to the other end that we received the shutdown */
 			partial_shutdown(ep_consumer, SHUT_WR);
-
-		/* print what we don't got */
-		hexdump_remain_print(hd, s);
+			hexdump_shutdown_print(hd);
+		}
+		else {
+			/* print how many is still here and we couldn't send */
+			hexdump_remain_print(hd, s);
+		}
 
 		/* update our tail pointer */
 		circular_buffer_advance_tail(b, s);
 
 	}
 	else if (FD_ISSET(producer, rfds)) {
-		/* print what we don't got */
+		/* print how many is still here and we couldn't send */
 		hexdump_remain_print(hd, 0);
 	}
 
+write_would_block:
 	return 0;
 }
 
@@ -86,14 +123,14 @@ enum pipe_status {
 	PIPE_BROKEN
 };
 enum pipe_status enable_read_write(struct endpoint *ep_producer,
-		struct endpoint *ep_consumer,	
+		struct endpoint *ep_consumer,
 		fd_set *rfds, fd_set *wfds,
 		struct circular_buffer_t *buf) {
 
 	int producer = ep_producer->fd;
 	int consumer = ep_consumer->fd;
-	
-	/* 
+
+	/*
 	 * Are our both endpoints, the consumer and the producer
 	 * closed? If we have data in the pipe means that the pipe
 	 * is broken, otherwise means that we are done, close the
@@ -105,7 +142,7 @@ enum pipe_status enable_read_write(struct endpoint *ep_producer,
 		else
 			return PIPE_CLOSED;
 	}
-	
+
 	/*
 	 * If our consumer closed his side of the pipe means that we cannot
 	 * write any data any more.
@@ -128,9 +165,9 @@ enum pipe_status enable_read_write(struct endpoint *ep_producer,
 		else
 			return PIPE_CLOSED;
 	}
-	
+
 	/*
-	 * If the producer closed his side of the pipe means that we will 
+	 * If the producer closed his side of the pipe means that we will
 	 * not have more data in the pipe.
 	 * If the pipe is already empty, close the consumer, closing the
 	 * pipe, acknowling to the consumer that we are closing.
@@ -145,7 +182,7 @@ enum pipe_status enable_read_write(struct endpoint *ep_producer,
 		}
 		else {
 			/* keep the pipe and don't close the consumer
-			 * we want to keep flushing all the data that 
+			 * we want to keep flushing all the data that
 			 * we have in the pipe before closing it
 			 * */
 		}
@@ -172,96 +209,121 @@ enum pipe_status enable_read_write(struct endpoint *ep_producer,
 int main(int argc, char *argv[]) {
 	int ret = -1;
 	int s;
-	struct endpoint src, dst;
+	struct endpoint A, B;
 	size_t buf_sizes[2] = {0, 0};
 	size_t skt_buf_sizes[2] = {0, 0};
-	const char *out_filenames[2] = {0, 0};
+	char *out_filenames[2] = {0, 0};
+	const char *colors[2] = {"\x1b[91m", "\x1b[94m"};
+	int colorless = 0;
+	sigset_t intset;
 
-	if (parse_cmd_line(argc, argv, &src, &dst, buf_sizes, skt_buf_sizes, 
-				out_filenames)) {
+	if (parse_cmd_line(argc, argv, &A, &B, buf_sizes, skt_buf_sizes,
+				out_filenames, &colorless)) {
+		what(argv);
 		usage(argv);
 		return ret;
 	}
 
-	/* us <--> dst */
-	printf("Connecting to dst %s:%s...\n", dst.host, dst.serv);
-	if (establish_connection(&dst, skt_buf_sizes) != 0) {
+	/*
+	 * Block all the signals and setup some handlers for SIGINT and
+	 * SIGTERM.
+	 * Those are blocked but they will be unblock if the intset signal
+	 * set mask is used.
+	 *
+	 * See block_all_signals and setup_signal_handlers to see exactly which
+	 * signals are blocked and handled.
+	 * */
+	if (block_all_signals() != 0
+			|| setup_signal_handlers() != 0
+			|| initialize_interrupt_sigset(&intset) != 0) {
+		perror("Setup signal handling failed");
+		goto setup_signal_failed;
+	}
+
+	/* disable the colors? */
+	if (colorless)
+		colors[0] = colors[1] = 0;
+
+	/* us <--> B */
+	printf("Connecting to B %s:%s...\n", B.host, B.serv);
+	if (establish_connection(&B, skt_buf_sizes, &intset) != 0) {
 		perror("Establish a connection to the destination failed");
 		goto establish_conn_failed;
 	}
 
-	/* src <--> us */
-	printf("Waiting for a connection from src %s:%s...\n", src.host, src.serv);
-	if (wait_for_connection(&src, skt_buf_sizes) != 0) {
+	/* A <--> us */
+	printf("Waiting for a connection from A %s:%s...\n", A.host, A.serv);
+	if (wait_for_connection(&A, skt_buf_sizes, &intset) != 0) {
 		perror("Wait for connection from the source failed");
 		goto wait_conn_failed;
 	}
 
 	printf("Allocating buffers: %lu and %lu bytes...\n", buf_sizes[0],
-					 			buf_sizes[1]);
-	struct circular_buffer_t buf_stod;
-	if (circular_buffer_init(&buf_stod, buf_sizes[0]) != 0) {
-		perror("Buffer allocation for src->dst failed");
-		goto buf_stod_failed;
-	}
-	
-	struct circular_buffer_t buf_dtos;
-	if (circular_buffer_init(&buf_dtos, buf_sizes[1]) != 0) {
-		perror("Buffer allocation for dst->src failed");
-		goto buf_dtos_failed;
+			buf_sizes[1]);
+	struct circular_buffer_t buf_AtoB;
+	if (circular_buffer_init(&buf_AtoB, buf_sizes[0]) != 0) {
+		perror("Buffer allocation for A->B failed");
+		goto buf_AtoB_failed;
 	}
 
-	struct hexdump hd_stod;
-	if (hexdump_init(&hd_stod, "src", "dst", "\x1b[91m", out_filenames[0]) != 0) {
-		perror("Hexdump src->dst allocation failed");
-		goto hd_src_to_dst_failed;
+	struct circular_buffer_t buf_BtoA;
+	if (circular_buffer_init(&buf_BtoA, buf_sizes[1]) != 0) {
+		perror("Buffer allocation for B->A failed");
+		goto buf_BtoA_failed;
 	}
 
-	struct hexdump hd_dtos;
-	if (hexdump_init(&hd_dtos, "dst", "src", "\x1b[94m", out_filenames[1]) != 0) {
-		perror("Hexdump dst->src allocation failed");
-		goto hd_dst_to_src_failed;
+	struct hexdump hd_AtoB;
+	if (hexdump_init(&hd_AtoB, "A", "B", colors[0], out_filenames[0]) != 0) {
+		perror("Hexdump A->B allocation failed");
+		goto hd_A_to_B_failed;
 	}
 
-	int nfds = MAX(src.fd, dst.fd) + 1;
+	struct hexdump hd_BtoA;
+	if (hexdump_init(&hd_BtoA, "B", "A", colors[1], out_filenames[1]) != 0) {
+		perror("Hexdump B->A allocation failed");
+		goto hd_B_to_A_failed;
+	}
+
+	int nfds = MAX(A.fd, B.fd) + 1;
 	fd_set rfds, wfds;
 
-	enum pipe_status pstatus_stod = PIPE_OPEN;
-	enum pipe_status pstatus_dtos = PIPE_OPEN;
-	
+	enum pipe_status pstatus_AtoB = PIPE_OPEN;
+	enum pipe_status pstatus_BtoA = PIPE_OPEN;
+
 	while (1) {
 		FD_ZERO(&rfds);
 		FD_ZERO(&wfds);
 
-		if (pstatus_stod == PIPE_OPEN)
-			pstatus_stod = enable_read_write(&src, &dst, 
-						&rfds, &wfds,
-						&buf_stod);
+		if (pstatus_AtoB == PIPE_OPEN)
+			pstatus_AtoB = enable_read_write(&A, &B,
+					&rfds, &wfds,
+					&buf_AtoB);
 
-		if (pstatus_dtos == PIPE_OPEN)
-			pstatus_dtos = enable_read_write(&dst, &src,
-						&rfds, &wfds,
-						&buf_dtos);
-		
+		if (pstatus_BtoA == PIPE_OPEN)
+			pstatus_BtoA = enable_read_write(&B, &A,
+					&rfds, &wfds,
+					&buf_BtoA);
 
-		if (pstatus_stod != PIPE_OPEN && pstatus_dtos != PIPE_OPEN)
+
+		if (pstatus_AtoB != PIPE_OPEN && pstatus_BtoA != PIPE_OPEN)
 			break; /* we finished: no data can be sent from
-				  src to dst nor dst to src. */
+				  A to B nor B to A. */
 
 
-		s = select(nfds, &rfds, &wfds, NULL, NULL);
+		EINTR_RETRY(pselect(nfds, &rfds, &wfds, NULL, NULL, &intset));
+
 		if (s == -1) {
 			perror("select call failed");
 			goto passthrough_failed;
 		}
 
-		if (passthrough(&src, &dst, &rfds, &wfds, &buf_stod, &hd_stod) != 0) {
-			perror("Passthrough from src to dst failed");
+		if (passthrough(&A, &B, &rfds, &wfds, &buf_AtoB, &hd_AtoB) != 0) {
+			perror("Passthrough from A to B failed");
 			goto passthrough_failed;
 		}
-		
-		if (passthrough(&dst, &src, &rfds, &wfds, &buf_dtos, &hd_dtos) != 0) {
-			perror("Passthrough from dst to src failed");
+
+		if (passthrough(&B, &A, &rfds, &wfds, &buf_BtoA, &hd_BtoA) != 0) {
+			perror("Passthrough from B to A failed");
 			goto passthrough_failed;
 		}
 	}
@@ -269,23 +331,37 @@ int main(int argc, char *argv[]) {
 	ret = 0;
 
 passthrough_failed:
-	hexdump_destroy(&hd_dtos);
+	hexdump_destroy(&hd_BtoA);
 
-hd_dst_to_src_failed:
-	hexdump_destroy(&hd_stod);
+hd_B_to_A_failed:
+	hexdump_destroy(&hd_AtoB);
 
-hd_src_to_dst_failed:
-	circular_buffer_destroy(&buf_dtos);
+hd_A_to_B_failed:
+	circular_buffer_destroy(&buf_BtoA);
 
-buf_dtos_failed:
-	circular_buffer_destroy(&buf_stod);
+buf_BtoA_failed:
+	circular_buffer_destroy(&buf_AtoB);
 
-buf_stod_failed:
-	shutdown_and_close(&src);
+buf_AtoB_failed:
+	shutdown_and_close(&A);
 
 wait_conn_failed:
-	shutdown_and_close(&dst);
+	shutdown_and_close(&B);
 
 establish_conn_failed:
-	return ret;
+setup_signal_failed:
+
+	if (!colorless)
+		printf("%s", "\x1b[0m"); /* reset */
+	if (interrupted)
+		printf("\nUser cancelled.\n");
+
+	if (out_filenames[0]) {
+		free(out_filenames[0]);
+	}
+	if (out_filenames[1]) {
+		free(out_filenames[1]);
+	}
+
+	return interrupted?  128 + interrupted : ret;
 }
